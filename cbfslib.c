@@ -3,12 +3,20 @@
 #include "cbfslib.h"
 #endif //CLASS_NAME_H_
 #include <assert.h>
+#include "xdr.h"
+#include <string.h>
 
 #define unused __attribute__((unused))
 #define CBFS_FILE_ATTR_TAG_COMPRESSION 0x42435a4c
 #define CBFS_FILE_ATTR_TAG_UNUSED 0
 #define CBFS_FILE_ATTR_TAG_UNUSED2 0xffffffff
+#define CBFS_COMPONENT_DELETED 0
+#define CBFS_COMPONENT_NULL 0xFFFFFFFF
+#define CBFS_CONTENT_DEFAULT_VALUE	(-1)
+#define MAX_CBFS_FILE_HEADER_BUFFER 1024
+#define CBFS_FILENAME_ALIGN	(16)
 
+extern struct xdr xdr_be;
 
 struct cbfs_file *cbfs_find_next_entry(struct cbfs_image *image,
 				       struct cbfs_file *entry);
@@ -19,67 +27,37 @@ struct cbfs_file *cbfs_get_entry(struct cbfs_image *image, const char *name);
 typedef int (*decomp_func_ptr) (char *in, int in_len, char *out, int out_len,
 				size_t *actual_size);
 
-static uint8_t get8(struct buffer *input)
+struct cbfs_file *cbfs_create_file_header(int type, size_t len,
+	const char *name);
+
+static inline uint32_t align_up(uint32_t value, uint32_t align)
 {
-	uint8_t ret = *input->data++;
-	input->size--;
-	return ret;
+	if (value % align)
+		value += align - (value % align);
+	return value;
 }
 
-static uint16_t get16be(struct buffer *input)
+size_t cbfs_calculate_file_header_size(const char *name)
 {
-	uint16_t ret;
-	ret = get8(input) << 8;
-	ret |= get8(input);
-	return ret;
+	return (sizeof(struct cbfs_file) +
+		align_up(strlen(name) + 1, CBFS_FILENAME_ALIGN));
 }
 
-static uint32_t get32be(struct buffer *input)
+struct cbfs_file *cbfs_create_file_header(int type,
+			    size_t len, const char *name)
 {
-	uint32_t ret;
-	ret = get16be(input) << 16;
-	ret |= get16be(input);
-	return ret;
+	int8_t reserved_memory[MAX_CBFS_FILE_HEADER_BUFFER];
+	struct cbfs_file *entry = (void *) &reserved_memory[0]; //malloc(MAX_CBFS_FILE_HEADER_BUFFER);
+	memset(entry, CBFS_CONTENT_DEFAULT_VALUE, MAX_CBFS_FILE_HEADER_BUFFER);
+	memcpy(entry->magic, CBFS_FILE_MAGIC, sizeof(entry->magic));
+	entry->type = htonl(type);
+	entry->len = htonl(len);
+	entry->attributes_offset = 0;
+	entry->offset = htonl(cbfs_calculate_file_header_size(name));
+	memset(entry->filename, 0, ntohl(entry->offset) - sizeof(*entry));
+	strcpy(entry->filename, name);
+	return entry;
 }
-
-static uint64_t get64be(struct buffer *input)
-{
-	uint64_t ret;
-	ret = get32be(input);
-	ret <<= 32;
-	ret |= get32be(input);
-	return ret;
-}
-
-static void put8(struct buffer *input, uint8_t val)
-{
-	input->data[input->size] = val;
-	input->size++;
-}
-
-static void put16be(struct buffer *input, uint16_t val)
-{
-	put8(input, val >> 8);
-	put8(input, val);
-}
-
-static void put32be(struct buffer *input, uint32_t val)
-{
-	put16be(input, val >> 16);
-	put16be(input, val);
-}
-
-static void put64be(struct buffer *input, uint64_t val)
-{
-	put32be(input, val >> 32);
-	put32be(input, val);
-}
-
-
-struct xdr xdr_be = {
-	get8, get16be, get32be, get64be,
-	put8, put16be, put32be, put64be
-};
 
 struct cbfs_file_attribute *cbfs_file_first_attr(struct cbfs_file *file)
 {
@@ -303,12 +281,6 @@ int cbfs_is_valid_entry(struct cbfs_image *image, struct cbfs_file *entry)
 						strlen(CBFS_FILE_MAGIC));
 }
 
-static inline uint32_t align_up(uint32_t value, uint32_t align)
-{
-	if (value % align)
-		value += align - (value % align);
-	return value;
-}
 
 struct cbfs_file *cbfs_find_next_entry(struct cbfs_image *image,
 				       struct cbfs_file *entry)
@@ -385,3 +357,94 @@ int cbfs_image_from_buffer(struct cbfs_image *out, struct buffer *in,
     printf("Selected image region is not a valid CBFS.\n");
 	return 1;
 }
+
+int cbfs_create_empty_entry(struct cbfs_file *entry, int type,
+			    size_t len, const char *name)
+{
+	struct cbfs_file *tmp = cbfs_create_file_header(type, len, name);
+	memcpy(entry, tmp, ntohl(tmp->offset));
+	//free(tmp);
+	memset(CBFS_SUBHEADER(entry), CBFS_CONTENT_DEFAULT_VALUE, len);
+	return 0;
+}
+
+int cbfs_merge_empty_entry(struct cbfs_image *image, struct cbfs_file *entry,
+			   unused void *arg)
+{
+	struct cbfs_file *next;
+	uint8_t *name;
+	uint32_t type, addr, last_addr;
+
+	type = ntohl(entry->type);
+	if (type == CBFS_COMPONENT_DELETED) {
+		// Ready to be recycled.
+		type = CBFS_COMPONENT_NULL;
+		entry->type = htonl(type);
+		// Place NUL byte as first byte of name to be viewed as "empty".
+		name = (void *)&entry[1];
+		*name = '\0';
+	}
+	if (type != CBFS_COMPONENT_NULL)
+		return 0;
+
+	next = cbfs_find_next_entry(image, entry);
+
+	while (next && cbfs_is_valid_entry(image, next)) {
+		type = ntohl(next->type);
+		if (type == CBFS_COMPONENT_DELETED) {
+			type = CBFS_COMPONENT_NULL;
+			next->type = htonl(type);
+		}
+		if (type != CBFS_COMPONENT_NULL)
+			return 0;
+
+		addr = cbfs_get_entry_addr(image, entry);
+		last_addr = cbfs_get_entry_addr(
+				image, cbfs_find_next_entry(image, next));
+
+		// Now, we find two deleted/empty entries; try to merge now.
+		//DEBUG("join_empty_entry: combine 0x%x+0x%x and 0x%x+0x%x.\n",
+		//      cbfs_get_entry_addr(image, entry), ntohl(entry->len),
+		//      cbfs_get_entry_addr(image, next), ntohl(next->len));
+		cbfs_create_empty_entry(entry, CBFS_COMPONENT_NULL,
+					(last_addr - addr -
+					 cbfs_calculate_file_header_size("")),
+					"");
+		//DEBUG("new empty entry: length=0x%x\n", ntohl(entry->len));
+		next = cbfs_find_next_entry(image, entry);
+	}
+	return 0;
+}
+
+
+int cbfs_remove_entry(struct cbfs_image *image, const char *name)
+{
+	struct cbfs_file *entry;
+	entry = cbfs_get_entry(image, name);
+	if (!entry) {
+		//ERROR("CBFS file %s not found.\n", name);
+		return -1;
+	}
+	//DEBUG("cbfs_remove_entry: Removed %s @ 0x%x\n",
+	      //entry->filename, cbfs_get_entry_addr(image, entry));
+	entry->type = htonl(CBFS_COMPONENT_DELETED);
+	cbfs_walk(image, cbfs_merge_empty_entry, NULL);
+	return 0;
+}
+
+int cbfs_walk(struct cbfs_image *image, cbfs_entry_callback callback,
+	      void *arg)
+{
+	int count = 0;
+	struct cbfs_file *entry;
+	for (entry = cbfs_find_first_entry(image);
+	     entry && cbfs_is_valid_entry(image, entry);
+	     entry = cbfs_find_next_entry(image, entry)) {
+		count ++;
+		if (callback(image, entry, arg) != 0)
+			break;
+	}
+	return count;
+}
+
+

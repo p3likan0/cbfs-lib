@@ -7,7 +7,12 @@
 #ifndef FIT
 #define FIT
 #include "fitlib.h"
+#include "xdr.h"
 #endif 
+#include "md5.h"
+
+extern struct xdr xdr_be;
+
 
 #define CHUNK 4*1024*1024
 
@@ -18,6 +23,20 @@ struct cbfs_fileheader {
     uint32_t checksum;
     uint32_t offset;
 } __PACKED;
+
+int32_t get_entry_len(struct cbfs_file *entry) {
+    struct buffer outheader;
+	outheader.data = &entry->len;	/* We're not modifying the data */
+	outheader.size = 0;
+    return xdr_be.get32(&outheader);
+}
+
+int32_t get_entry_offset(struct cbfs_file *entry) {
+    struct buffer outheader;
+	outheader.data = &entry->offset;	/* We're not modifying the data */
+	outheader.size = 0;
+    return xdr_be.get32(&outheader);
+}
 
 int main(int argc, char* argv[]) {
     if( argc != 3 ){
@@ -34,7 +53,7 @@ int main(int argc, char* argv[]) {
 
 	struct buffer buffer;
     buffer.offset = 0;
-	buffer.size = 4*1024*1024;
+	buffer.size = CHUNK;
 	buffer.name = strdup("BIOS");
 	buffer.data = buf;
 
@@ -46,12 +65,21 @@ int main(int argc, char* argv[]) {
         printf("Cant read .rom\n");
 		return 1;
     }else{
-	    if ((entry = cbfs_get_entry(&image, argv[2])) == NULL) {
+        entry = cbfs_get_entry(&image, argv[2]);
+	    if (entry == NULL) {
         printf("Can not find entry\n");
 	    }
+       	cbfs_remove_entry(&image, argv[2]);
 
-        int32_t config_file_address = cbfs_get_entry_addr(&image, entry);
-        printf("Found %s in address: %x\n", argv[2], config_file_address);
+        MD5_CTX ctx;
+        MD5Init(&ctx);
+        MD5Update(&ctx, buf, CHUNK);
+        MD5Final(&ctx);
+
+        printf("Md5 sum is \n");
+        for(int i=0; i<16; i++){
+            printf("%x", ctx.digest[i]);
+        }
     }
 
   return 0;

@@ -9,19 +9,8 @@
 #define CBFS_HEADER_VERSION1 0x31313131
 #define CBFS_HEADER_VERSION2 0x31313132
 #define CBFS_ENTRY_ALIGNMENT 64
-
+#define CBFS_SUBHEADER(_p) ( (void *) ((((uint8_t *) (_p)) + ntohl((_p)->offset))) )
 #define __PACKED __attribute__((gcc_struct, packed))
-
-struct xdr {
-	uint8_t (*get8)(struct buffer *input);
-	uint16_t (*get16)(struct buffer *input);
-	uint32_t (*get32)(struct buffer *input);
-	uint64_t (*get64)(struct buffer *input);
-	void (*put8)(struct buffer *input, uint8_t val);
-	void (*put16)(struct buffer *input, uint16_t val);
-	void (*put32)(struct buffer *input, uint32_t val);
-	void (*put64)(struct buffer *input, uint64_t val);
-};
 
 struct cbfs_file_attr_compression {
 	uint32_t tag;
@@ -78,4 +67,8 @@ struct cbfs_image {
 	struct cbfs_header header;
 };
 
+typedef int (*cbfs_entry_callback)(struct cbfs_image *image,
+				   struct cbfs_file *file,
+				   void *arg);
 
+int cbfs_remove_entry(struct cbfs_image *image, const char *name);
